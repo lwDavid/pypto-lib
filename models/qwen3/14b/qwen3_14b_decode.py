@@ -990,7 +990,7 @@ if __name__ == "__main__":
                               "%%(default)s" % BATCH_TILE))
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--max-seq", action="store_true", default=False)
-    parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int)
+    parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     args = parser.parse_args()
 
     result = run(
