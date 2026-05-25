@@ -1096,16 +1096,8 @@ if __name__ == "__main__":
             enable_l2_swimlane=args.enable_l2_swimlane,
             enable_pmu=args.enable_pmu,
         ),
-        # Tolerance temporarily loosened from 3e-3 to 1.5e-2 to accommodate
-        # the GM cross-lane race in the fa_qks / fa_svo mixed roots (the
-        # ExpandMixedKernel pass does not insert tpush/tpop between cube
-        # tile.store and vec tile.load on the shared GM scratch tensors,
-        # so device output is non-deterministic). Observed drift: ~3-5e-3
-        # on a2a3 hardware, ~6e-3 to ~1.0e-2 on a2a3sim where the
-        # simulator's scheduling widens the race window. Restore to 3e-3
-        # once hw-native-sys/pypto#1433 lands a fix.
-        rtol=1.5e-2,
-        atol=1.5e-2,
+        rtol=3e-3,
+        atol=3e-3,
     )
     if not result.passed:
         if result.error:
