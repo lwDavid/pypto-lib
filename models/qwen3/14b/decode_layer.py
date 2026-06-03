@@ -64,6 +64,8 @@ import torch
 from pypto.backend import BackendType, set_backend_type
 from pypto.runtime import RunConfig
 
+from rms_lm_head import rms_lm_head  # LM head for the fused multi-layer decode_fwd
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Functional config — model architecture + workload.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -251,9 +253,9 @@ assert N_PER_CAST_K * OUT_TN == MLP_K_SLICE
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-@pl.jit
-def qwen3_decode_mpmd(  # noqa: PLR0913 — model signature is intrinsic
-    hidden_states: pl.Tensor,
+@pl.jit.inline
+def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
+    hidden_states: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
     input_rms_weight: pl.Tensor,
     wq: pl.Tensor,
     wk: pl.Tensor,
@@ -270,8 +272,18 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — model signature is intrinsic
     w_up: pl.Tensor,
     w_down: pl.Tensor,
     post_rms_weight: pl.Tensor,
-    out: pl.Out[pl.Tensor],
-):
+    out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    layer_idx: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+    # Per-layer offsets into the STACKED weights / KV cache. For the single-layer
+    # entry (qwen3_decode_mpmd) layer_idx==0 so every base is 0 and single-layer
+    # weight tensors work unchanged; decode_fwd passes the running loop index.
+    layer_hidden_base = layer_idx * HIDDEN
+    layer_inter_base = layer_idx * INTERMEDIATE
+    layer_cache_base = layer_idx * (BATCH * NUM_KV_HEADS * MAX_SEQ)
+    q_norm_w = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
+    k_norm_w = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
+
     # Scope 1
     normed_states = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     inv_rms_states = pl.create_tensor([BATCH, 1], dtype=pl.FP32)  # deferred 1/rms denominator
@@ -292,7 +304,7 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — model signature is intrinsic
         for kb in pl.pipeline(xg_core, HIDDEN // RMSNORM_K_CHUNK, XG_BLOCKS, stage=2):
             k0 = kb * RMSNORM_K_CHUNK
             x_chunk = pl.cast(hidden_states[:, k0 : k0 + RMSNORM_K_CHUNK], target_type=pl.FP32)
-            gamma = input_rms_weight[:, k0 : k0 + RMSNORM_K_CHUNK]
+            gamma = pl.slice(input_rms_weight, [1, RMSNORM_K_CHUNK], [layer_idx, k0])
             xg = pl.col_expand_mul(x_chunk, gamma)
             normed_states = pl.assemble(normed_states, pl.cast(xg, target_type=pl.BF16), [0, k0])
 
@@ -322,13 +334,13 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — model signature is intrinsic
             n0 = q_n_region + n_sub * TN
             q_acc = pl.matmul(
                 normed_states[:, q_k_base : q_k_base + TK],
-                wq[q_k_base : q_k_base + TK, n0 : n0 + TN],
+                wq[layer_hidden_base + q_k_base : layer_hidden_base + q_k_base + TK, n0 : n0 + TN],
                 out_dtype=pl.FP32,
             )
             for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):
                 kk = q_k_base + kc * TK
                 q_acc = pl.matmul_acc(
-                    q_acc, normed_states[:, kk : kk + TK], wq[kk : kk + TK, n0 : n0 + TN]
+                    q_acc, normed_states[:, kk : kk + TK], wq[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
                 )
             q_proj = pl.assemble(q_proj, q_acc, [0, n0], atomic=pl.AtomicType.Add)
 
@@ -342,13 +354,13 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — model signature is intrinsic
             n0 = k_n_region + n_sub * TN
             k_acc = pl.matmul(
                 normed_states[:, k_k_base : k_k_base + TK],
-                wk[k_k_base : k_k_base + TK, n0 : n0 + TN],
+                wk[layer_hidden_base + k_k_base : layer_hidden_base + k_k_base + TK, n0 : n0 + TN],
                 out_dtype=pl.FP32,
             )
             for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):
                 kk = k_k_base + kc * TK
                 k_acc = pl.matmul_acc(
-                    k_acc, normed_states[:, kk : kk + TK], wk[kk : kk + TK, n0 : n0 + TN]
+                    k_acc, normed_states[:, kk : kk + TK], wk[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
                 )
             k_proj = pl.assemble(k_proj, k_acc, [0, n0], atomic=pl.AtomicType.Add)
 
@@ -362,13 +374,13 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — model signature is intrinsic
             n0 = v_n_region + n_sub * TN
             v_acc = pl.matmul(
                 normed_states[:, v_k_base : v_k_base + TK],
-                wv[v_k_base : v_k_base + TK, n0 : n0 + TN],
+                wv[layer_hidden_base + v_k_base : layer_hidden_base + v_k_base + TK, n0 : n0 + TN],
                 out_dtype=pl.FP32,
             )
             for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):
                 kk = v_k_base + kc * TK
                 v_acc = pl.matmul_acc(
-                    v_acc, normed_states[:, kk : kk + TK], wv[kk : kk + TK, n0 : n0 + TN]
+                    v_acc, normed_states[:, kk : kk + TK], wv[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
                 )
             v_proj = pl.assemble(v_proj, v_acc, [0, n0], atomic=pl.AtomicType.Add)
 
@@ -458,13 +470,13 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — model signature is intrinsic
                 pl.slice(q_proj, [BATCH, Q_PER_KV * HEAD_DIM], [0, q0]), inv_rms_col
             )
             q_chunk = pl.reshape(q_slice, [BATCH * Q_PER_KV, HEAD_DIM])
-            q_g = pl.col_expand_mul(q_chunk, q_norm_weight)
+            q_g = pl.col_expand_mul(q_chunk, q_norm_w)
             q_proj_norm = pl.assemble(
                 q_proj_norm, pl.reshape(q_g, [BATCH, Q_PER_KV * HEAD_DIM]), [0, q0]
             )
             k0 = h * HEAD_DIM
             k_chunk = pl.row_expand_mul(pl.slice(k_proj, [BATCH, HEAD_DIM], [0, k0]), inv_rms_col)
-            k_g = pl.col_expand_mul(k_chunk, k_norm_weight)
+            k_g = pl.col_expand_mul(k_chunk, k_norm_w)
             k_proj_norm = pl.assemble(k_proj_norm, k_g, [0, k0])
 
     # Step (b): per-head 1/rms reciprocal — DEFERRED, folded into rope_qkv below.
@@ -512,7 +524,7 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — model signature is intrinsic
             k_hi = k_full[:, HALF_DIM:HEAD_DIM]
             rot_lo = pl.sub(pl.col_expand_mul(k_lo, cos_lo), pl.col_expand_mul(k_hi, sin_lo))
             rot_hi = pl.add(pl.col_expand_mul(k_hi, cos_hi), pl.col_expand_mul(k_lo, sin_hi))
-            cache_row = b * NUM_KV_HEADS * MAX_SEQ + ki * MAX_SEQ + pos
+            cache_row = layer_cache_base + b * NUM_KV_HEADS * MAX_SEQ + ki * MAX_SEQ + pos
             k_cache = pl.assemble(k_cache, pl.cast(rot_lo, target_type=pl.BF16), [cache_row, 0])
             k_cache = pl.assemble(k_cache, pl.cast(rot_hi, target_type=pl.BF16), [cache_row, HALF_DIM])
             v_row_bf16 = pl.cast(
@@ -626,7 +638,7 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — model signature is intrinsic
                 q_pad_row_g = fa_b * NUM_KV_HEADS * Q_HEAD_PAD + gi * Q_HEAD_PAD
                 q_padded = all_q_padded[q_pad_row_g : q_pad_row_g + Q_HEAD_PAD, :]
                 g_base = (fa_b * NUM_KV_HEADS + gi) * MAX_CTX_BLOCKS * Q_HEAD_PAD
-                cache_row = fa_b * NUM_KV_HEADS * MAX_SEQ + kvh * MAX_SEQ + s0
+                cache_row = layer_cache_base + fa_b * NUM_KV_HEADS * MAX_SEQ + kvh * MAX_SEQ + s0
 
                 # QK matmul (cube) -> C2V boundary move (first vec consumer).
                 k_tile = k_cache[cache_row : cache_row + SEQ_TILE, :]
@@ -746,13 +758,14 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — model signature is intrinsic
                     deps=[out_seed_tid, attn_done_tid],
                 ) as out_tid:
                     out_a0 = attn_out[:, k_op : k_op + OUT_INNER_TK]
-                    out_w0 = wo[k_op : k_op + OUT_INNER_TK, n_op : n_op + OUT_TN]
+                    out_w0 = wo[layer_hidden_base + k_op : layer_hidden_base + k_op + OUT_INNER_TK, n_op : n_op + OUT_TN]
                     out_c_acc = pl.matmul(out_a0, out_w0, out_dtype=pl.FP32)
                     for out_lk in pl.pipeline(1, OUT_N_SUB_K, stage=2):
                         out_ks_off = out_lk * OUT_INNER_TK
                         out_a_k = attn_out[:, k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK]
                         out_w_k = wo[
-                            k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK, n_op : n_op + OUT_TN
+                            layer_hidden_base + k_op + out_ks_off : layer_hidden_base + k_op + out_ks_off + OUT_INNER_TK,
+                            n_op : n_op + OUT_TN,
                         ]
                         out_c_acc = pl.matmul_acc(out_c_acc, out_a_k, out_w_k)
                     attn_proj_fp32 = pl.assemble(
@@ -792,7 +805,7 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — model signature is intrinsic
                     # Explicit post-RMS gamma: gate/up input = h1 * post_gamma. gamma is
                     # per-K (the matmul contraction dim) so it canNOT defer past the matmul
                     # like inv_rms does — it scales the input here (with raw w_gate/w_up).
-                    post_gamma = post_rms_weight[:, k0 : k0 + K_CHUNK]
+                    post_gamma = pl.slice(post_rms_weight, [1, K_CHUNK], [layer_idx, k0])
                     mlp_norm_in = pl.assemble(
                         mlp_norm_in,
                         pl.cast(pl.col_expand_mul(resid_fp32, post_gamma), target_type=pl.BF16),
@@ -827,12 +840,12 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — model signature is intrinsic
                     deps=[cast_tids[k_split], gate_seed_tid],
                 ) as gate_tid:
                     a0 = mlp_norm_in[:, k0 : k0 + MLP_INNER_TK]
-                    w0 = w_gate[k0 : k0 + MLP_INNER_TK, n0 : n0 + MLP_TN]
+                    w0 = w_gate[layer_hidden_base + k0 : layer_hidden_base + k0 + MLP_INNER_TK, n0 : n0 + MLP_TN]
                     c_acc = pl.matmul(a0, w0, out_dtype=pl.FP32)
                     for lk in pl.pipeline(1, MLP_N_SUB_K, stage=2):
                         ks_off = lk * MLP_INNER_TK
                         a_k = mlp_norm_in[:, k0 + ks_off : k0 + ks_off + MLP_INNER_TK]
-                        w_k = w_gate[k0 + ks_off : k0 + ks_off + MLP_INNER_TK, n0 : n0 + MLP_TN]
+                        w_k = w_gate[layer_hidden_base + k0 + ks_off : layer_hidden_base + k0 + ks_off + MLP_INNER_TK, n0 : n0 + MLP_TN]
                         c_acc = pl.matmul_acc(c_acc, a_k, w_k)
                     gate_acc_all = pl.assemble(gate_acc_all, c_acc, [0, n0], atomic=pl.AtomicType.Add)
                 gate_tids[n_out * K_SPLITS_MLP + k_split] = gate_tid
@@ -843,12 +856,12 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — model signature is intrinsic
                     deps=[cast_tids[k_split], up_seed_tid],
                 ) as up_tid:
                     a0 = mlp_norm_in[:, k0 : k0 + MLP_INNER_TK]
-                    w0 = w_up[k0 : k0 + MLP_INNER_TK, n0 : n0 + MLP_TN]
+                    w0 = w_up[layer_hidden_base + k0 : layer_hidden_base + k0 + MLP_INNER_TK, n0 : n0 + MLP_TN]
                     c_acc = pl.matmul(a0, w0, out_dtype=pl.FP32)
                     for lk in pl.pipeline(1, MLP_N_SUB_K, stage=2):
                         ks_off = lk * MLP_INNER_TK
                         a_k = mlp_norm_in[:, k0 + ks_off : k0 + ks_off + MLP_INNER_TK]
-                        w_k = w_up[k0 + ks_off : k0 + ks_off + MLP_INNER_TK, n0 : n0 + MLP_TN]
+                        w_k = w_up[layer_hidden_base + k0 + ks_off : layer_hidden_base + k0 + ks_off + MLP_INNER_TK, n0 : n0 + MLP_TN]
                         c_acc = pl.matmul_acc(c_acc, a_k, w_k)
                     up_acc_all = pl.assemble(up_acc_all, c_acc, [0, n0], atomic=pl.AtomicType.Add)
                 up_tids[n_out * K_SPLITS_MLP + k_split] = up_tid
@@ -895,12 +908,12 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — model signature is intrinsic
                     deps=[seed_tid, silu_tids[k_split]],
                 ) as down_tid:
                     a0 = mlp_tile[:, k0 : k0 + DOWN_TK]
-                    w0 = w_down[k0 : k0 + DOWN_TK, n0 : n0 + DOWN_TN]
+                    w0 = w_down[layer_inter_base + k0 : layer_inter_base + k0 + DOWN_TK, n0 : n0 + DOWN_TN]
                     c_acc = pl.matmul(a0, w0, out_dtype=pl.FP32)
                     for lk in pl.pipeline(1, N_SUB_K, stage=2):
                         ks_off = lk * DOWN_TK
                         a_k = mlp_tile[:, k0 + ks_off : k0 + ks_off + DOWN_TK]
-                        w_k = w_down[k0 + ks_off : k0 + ks_off + DOWN_TK, n0 : n0 + DOWN_TN]
+                        w_k = w_down[layer_inter_base + k0 + ks_off : layer_inter_base + k0 + ks_off + DOWN_TK, n0 : n0 + DOWN_TN]
                         c_acc = pl.matmul_acc(c_acc, a_k, w_k)
                     down_acc_all = pl.assemble(down_acc_all, c_acc, [0, n0], atomic=pl.AtomicType.Add)
                 down_tids[n_out * K_SPLITS + k_split] = down_tid
@@ -917,6 +930,100 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — model signature is intrinsic
                 acc_chunk = down_acc_all[:, n0 : n0 + DOWN_TN]
                 out_chunk = pl.add(acc_chunk, resid_block)
                 out = pl.assemble(out, pl.cast(out_chunk, target_type=pl.BF16), [0, n0])
+    return out
+
+
+NUM_LAYERS = 40  # full Qwen3-14B depth, for the fused decode_fwd loop
+
+
+@pl.jit
+def qwen3_decode_mpmd(  # noqa: PLR0913 — single-layer entry (external API unchanged)
+    hidden_states: pl.Tensor,
+    input_rms_weight: pl.Tensor,
+    wq: pl.Tensor,
+    wk: pl.Tensor,
+    wv: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    k_norm_weight: pl.Tensor,
+    seq_lens: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    k_cache: pl.Tensor,
+    v_cache: pl.Tensor,
+    wo: pl.Tensor,
+    w_gate: pl.Tensor,
+    w_up: pl.Tensor,
+    w_down: pl.Tensor,
+    post_rms_weight: pl.Tensor,
+    out: pl.Out[pl.Tensor],
+):
+    res = _decode_layer(
+        hidden_states, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
+        seq_lens, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
+        post_rms_weight, out, 0,
+    )
+    return res
+
+
+@pl.jit
+def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM head
+    hidden_states: pl.Tensor,
+    input_rms_weight: pl.Tensor,
+    wq: pl.Tensor,
+    wk: pl.Tensor,
+    wv: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    k_norm_weight: pl.Tensor,
+    seq_lens: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    k_cache: pl.Tensor,
+    v_cache: pl.Tensor,
+    wo: pl.Tensor,
+    w_gate: pl.Tensor,
+    w_up: pl.Tensor,
+    w_down: pl.Tensor,
+    post_rms_weight: pl.Tensor,
+    final_norm_weight: pl.Tensor,
+    lm_head_weight: pl.Tensor,
+    out: pl.Out[pl.Tensor],
+):
+    # Device-side fused decode: loop the inline body over all NUM_LAYERS, slicing
+    # each layer's weights / KV-cache region by layer_idx, then run the LM head.
+    # Weights are STACKED [NUM_LAYERS*HIDDEN, ...] / [NUM_LAYERS*INTERMEDIATE, ...];
+    # k_cache / v_cache cover [NUM_LAYERS*BATCH*NUM_KV_HEADS*MAX_SEQ, ...]; out is
+    # logits [BATCH, VOCAB].
+    # Seed the loop-carried hidden from hidden_states (create_tensor + tiled copy
+    # under a pl.parallel dispatch — mirrors the original decode_fwd; a create_tensor
+    # seed is required so the loop-carried tensor has inferable metadata).
+    # Seed the loop-carried hidden from hidden_states via a create_tensor + tiled
+    # copy (a create_tensor seed is required: passing the external param to one
+    # _decode_layer call and a create_tensor to the loop trips inline metadata
+    # inference — see the layer-0-external variant which raises that error).
+    #
+    # KNOWN BUG (WIP): the fused output is currently ALL-ZEROS. Isolation proved the
+    # copy seed itself is correct (a copy-only decode_fwd reproduces hidden_states
+    # exactly, 100%), but the inlined body's pl.spmd reads of `cur` do not establish
+    # a dependency on this copy_hidden write (a plain pl.at read like copy_out does),
+    # so they race and read cur's pre-write zeros. Fix needs an explicit
+    # cross-dispatch fence before the first layer (cf. the body's own `attn_fence`)
+    # or to make the body's first read (x_gamma, a pl.spmd) dep on its input.
+    cur = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+    for cb0 in pl.parallel(0, BATCH, BATCH):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_hidden"):
+            for ckb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
+                ck0 = ckb * RMSNORM_K_CHUNK
+                cur = pl.assemble(
+                    cur, pl.slice(hidden_states, [BATCH, RMSNORM_K_CHUNK], [cb0, ck0]), [cb0, ck0]
+                )
+    for layer_idx in pl.range(NUM_LAYERS):
+        next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+        cur = _decode_layer(
+            cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
+            seq_lens, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
+            post_rms_weight, next_hidden, layer_idx,
+        )
+    out = rms_lm_head(cur, final_norm_weight, lm_head_weight, seq_lens, out)
     return out
 
 
