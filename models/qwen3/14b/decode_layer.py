@@ -1129,10 +1129,6 @@ INPUT_NAMES = (
 )
 
 
-def load_inputs(data_in_dir: Path) -> list[torch.Tensor]:
-    return [torch.load(data_in_dir / f"{name}.pt", weights_only=True) for name in INPUT_NAMES]
-
-
 def _smoke_inputs() -> list[torch.Tensor]:
     def randn(shape, dtype):
         return torch.empty(shape, dtype=dtype).normal_()
@@ -1348,12 +1344,6 @@ if __name__ == "__main__":
                              "maximum-load performance run; default samples varied random lengths.")
     parser.add_argument("--seed", type=int, default=1234,
                         help="RNG seed for the random fixture (reproducible inputs + golden).")
-    parser.add_argument(
-        "--data-dir",
-        type=Path,
-        default=Path(__file__).parent / "build_output" / "data",
-        help="only used by --validate-fwd (pre-generated stacked-fwd inputs).",
-    )
     parser.add_argument("--smoke", action="store_true", default=False,
                         help="compile-only (no device); also the implicit behavior on *sim platforms.")
     parser.add_argument("--no-dep-gen", action="store_true", default=False,
@@ -1412,8 +1402,23 @@ if __name__ == "__main__":
             raise SystemExit(1)
         raise SystemExit(0)
 
-    # ── --validate-fwd: pre-generated stacked-fwd inputs from --data-dir. ──
-    inputs = load_inputs(args.data_dir / "in")
+    # ── --validate-fwd: self-contained random-input fused decode_fwd check. ──
+    # Builds N-layer weight/KV stacks by replicating ONE random single-layer fixture
+    # (every layer computes "layer 0"), runs decode_fwd (N layers + on-device LM head
+    # -> logits), and compares against a host chain reference (chain N hidden -> final
+    # RMSNorm + lm_head). Exercises runtime layer_idx slicing, the layer->layer
+    # out_consolidate dependency, and the LM head reading the final layer's
+    # consolidated output. The host chain feeds each output as the next hidden (KV
+    # past[0:pos] untouched, current pos overwritten each layer, reproducing the
+    # in-kernel const-layer-0 chain) — so each `fixture_list()` call must return the
+    # SAME values (fixed seed), only fresh memory.
+    #
+    # NOTE: stacking replicates the weights N times, so device memory grows ~linearly
+    # with N (the MLP weights dominate, ~0.5 GB/layer); keep N small (4-8). A single
+    # large-N dispatch also risks the AICPU stream-sync timeout (~2000 ms) — the full
+    # 40-layer path uses the chunked decode_fwd_layers instead.
+    N = args.fwd_layers
+    _FWD_NLAYERS = N
     run_cfg = RunConfig(
         platform=args.platform,
         device_id=args.device,
@@ -1423,47 +1428,45 @@ if __name__ == "__main__":
         dump_passes=True,
     )
 
-    # Full fused decode_fwd validation: N stacked layers + on-device LM head -> logits,
-    # vs host (chain N hidden -> final RMSNorm + lm_head matmul). Builds N-layer stacks by
-    # replicating the single-layer weights (every layer computes layer 0) and exercises the
-    # runtime layer_idx slicing, the layer->layer out_consolidate dependency, and the LM
-    # head reading the final layer's consolidated output. The host chain feeds each output
-    # as the next hidden (KV past[0:pos] untouched, current pos overwritten each layer, so
-    # it reproduces the in-kernel const-layer-0 chain).
-    if args.validate_fwd:
-        N = args.fwd_layers
-        _FWD_NLAYERS = N
-        def stack0(t, reps):  # replicate along dim 0
-            return torch.cat([t] * reps, dim=0).contiguous()
-        hs, irw, wq_, wk_, wv_, qn, kn, sl, rc, rs, kc, vc, wo_, wg, wu, wd, prw = inputs
-        torch.manual_seed(1234)
-        final_norm_w = torch.empty([1, HIDDEN], dtype=torch.float32).normal_() * 0.1 + 1.0
-        lm_head_w = (torch.empty([VOCAB, HIDDEN], dtype=torch.bfloat16).normal_() * 0.02)
-        stacked = [
-            hs, stack0(irw, N), stack0(wq_, N), stack0(wk_, N), stack0(wv_, N),
-            stack0(qn, N), stack0(kn, N), sl, rc, rs, stack0(kc, N), stack0(vc, N),
-            stack0(wo_, N), stack0(wg, N), stack0(wu, N), stack0(wd, N), stack0(prw, N),
-            final_norm_w, lm_head_w,
-        ]
-        logits = torch.zeros(BATCH, VOCAB, dtype=torch.float32)
-        decode_fwd(*stacked, logits, config=run_cfg)
-        # host ref: chain N -> final RMSNorm -> lm_head
-        ref_hidden = inputs[0]; ref_out = None
-        for _step in range(N):
-            ci = load_inputs(args.data_dir / "in"); ci[0] = ref_hidden
-            ref_out = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
-            qwen3_decode_mpmd(*ci, ref_out, config=run_cfg)
-            ref_hidden = ref_out.clone()
-        hn = ref_out.float()
-        inv = torch.rsqrt(hn.pow(2).mean(-1, keepdim=True) + EPS)
-        ref_normed = (hn * inv) * final_norm_w.float()
-        ref_logits = ref_normed @ lm_head_w.float().t()  # [BATCH, VOCAB]
-        a = logits.cpu(); e = ref_logits.cpu()
-        # compare argmax (the actual generation signal) + value closeness
-        amax_k = a.argmax(-1); amax_r = e.argmax(-1)
-        argmax_match = int((amax_k == amax_r).sum())
-        close = torch.isclose(a, e, rtol=5e-2, atol=5e-2)
-        print(f"[stacked-fwd {N}L+LMhead] argmax match {argmax_match}/{BATCH} | "
-              f"logits {int(close.sum())/a.numel():.4%} within 5e-2 | "
-              f"max_abs_err={(a-e).abs().max():.4f} | kernel_argmax={amax_k.tolist()} ref_argmax={amax_r.tolist()}")
-        raise SystemExit(0 if argmax_match == BATCH else 1)
+    def fixture_list():  # fresh copies, identical values (fixed seed) on every call
+        d = random_inputs(full_seq=args.max_seq, seed=args.seed)
+        return [d[name] for name in INPUT_NAMES]
+
+    def stack0(t, reps):  # replicate along dim 0
+        return torch.cat([t] * reps, dim=0).contiguous()
+
+    inputs = fixture_list()
+    hs, irw, wq_, wk_, wv_, qn, kn, sl, rc, rs, kc, vc, wo_, wg, wu, wd, prw = inputs
+    torch.manual_seed(args.seed)
+    final_norm_w = torch.empty([1, HIDDEN], dtype=torch.float32).normal_() * 0.1 + 1.0
+    lm_head_w = torch.empty([VOCAB, HIDDEN], dtype=torch.bfloat16).normal_() * 0.02
+    stacked = [
+        hs, stack0(irw, N), stack0(wq_, N), stack0(wk_, N), stack0(wv_, N),
+        stack0(qn, N), stack0(kn, N), sl, rc, rs, stack0(kc, N), stack0(vc, N),
+        stack0(wo_, N), stack0(wg, N), stack0(wu, N), stack0(wd, N), stack0(prw, N),
+        final_norm_w, lm_head_w,
+    ]
+    print(f"[decode_layer] validate-fwd | N={N} layers + LM head | platform={args.platform} "
+          f"device={args.device} seq={'MAX' if args.max_seq else 'varied'} seed={args.seed}")
+    logits = torch.zeros(BATCH, VOCAB, dtype=torch.float32)
+    decode_fwd(*stacked, logits, config=run_cfg)
+    # host ref: chain N -> final RMSNorm -> lm_head
+    ref_hidden = inputs[0]; ref_out = None
+    for _step in range(N):
+        ci = fixture_list(); ci[0] = ref_hidden
+        ref_out = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
+        qwen3_decode_mpmd(*ci, ref_out, config=run_cfg)
+        ref_hidden = ref_out.clone()
+    hn = ref_out.float()
+    inv = torch.rsqrt(hn.pow(2).mean(-1, keepdim=True) + EPS)
+    ref_normed = (hn * inv) * final_norm_w.float()
+    ref_logits = ref_normed @ lm_head_w.float().t()  # [BATCH, VOCAB]
+    a = logits.cpu(); e = ref_logits.cpu()
+    # compare argmax (the actual generation signal) + value closeness
+    amax_k = a.argmax(-1); amax_r = e.argmax(-1)
+    argmax_match = int((amax_k == amax_r).sum())
+    close = torch.isclose(a, e, rtol=5e-2, atol=5e-2)
+    print(f"[stacked-fwd {N}L+LMhead] argmax match {argmax_match}/{BATCH} | "
+          f"logits {int(close.sum())/a.numel():.4%} within 5e-2 | "
+          f"max_abs_err={(a-e).abs().max():.4f} | kernel_argmax={amax_k.tolist()} ref_argmax={amax_r.tolist()}")
+    raise SystemExit(0 if argmax_match == BATCH else 1)
