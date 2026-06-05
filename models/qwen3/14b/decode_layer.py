@@ -1313,8 +1313,10 @@ def golden_decode_layer(values: dict) -> None:
     values["out"] = _bf16(down + h1_bf16).to(torch.bfloat16)     # residual is bf16(h1)
 
 
-def _build_specs(inputs: dict, TensorSpec) -> list:
+def _build_specs(inputs: dict) -> list:
     """TensorSpec list in qwen3_decode_mpmd parameter order, from a fixture dict."""
+    from golden import TensorSpec  # repo root added to sys.path in __main__
+
     specs = [
         TensorSpec(name, list(inputs[name].shape), inputs[name].dtype, init_value=inputs[name])
         for name in INPUT_NAMES
@@ -1379,10 +1381,10 @@ if __name__ == "__main__":
     # ── Default single-layer unit test: RANDOM inputs, on-the-fly torch golden,
     # on-device run + compare, all through the golden/ harness. ──
     if not args.validate_fwd:
-        from golden import TensorSpec, ratio_allclose, run_jit
+        from golden import ratio_allclose, run_jit
 
         inputs = random_inputs(full_seq=args.max_seq, seed=args.seed)
-        specs = _build_specs(inputs, TensorSpec)
+        specs = _build_specs(inputs)
         print(f"[decode_layer] single-layer golden unit test | platform={args.platform} "
               f"device={args.device} seq={'MAX' if args.max_seq else 'varied'} seed={args.seed} "
               f"seq_lens={inputs['seq_lens'].tolist()}")
