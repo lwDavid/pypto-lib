@@ -57,12 +57,17 @@ def dispatch(
         #   - recv_token    = 0 -> safe scatter target (combine ignores via count)
         # The recv_x INT8 tail is left uninitialized; pairing it with scale_dq=0
         # is sufficient to neutralize its contribution after dequant.
+        # Vectorized tail zero-init: one fill per buffer instead of
+        # N_LOCAL_EXPERTS * RECV_MAX scalar writes. Same neutral tails, far less
+        # scalar-store time on this serial CORE_GROUP kernel (which sits on the
+        # decode critical path between gate and expert_routed).
+        recv_scale_dq[:, :] = pl.full([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32, value=0.0)
+        recv_weights[:, :] = pl.full([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32, value=0.0)
+        recv_token[:, :] = pl.full([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.INT32, value=0)
+        # recv_expert_count is [E, 1] -- a 4-byte row that fails the 32B tile
+        # alignment for a vector fill, so zero its E entries with scalar writes.
         for e in pl.range(N_LOCAL_EXPERTS):
             pl.write(recv_expert_count, [e, 0], pl.cast(0, pl.INT32))
-            for s in pl.range(RECV_MAX):
-                pl.write(recv_scale_dq, [e, s], 0.0)
-                pl.write(recv_weights, [e, s], 0.0)
-                pl.write(recv_token, [e, s], pl.cast(0, pl.INT32))
 
         for t in pl.range(T):
             for k in pl.range(TOPK):
