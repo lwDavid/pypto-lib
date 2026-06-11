@@ -70,6 +70,20 @@ QUANT_TOKEN_TILE = 8
 QUANT_K_TILE = O_GROUPS * O_LORA // 2
 NEG_INF = -1.0e20
 
+# Tiling invariants the kernels below rely on. Assert at import so a future
+# config change fails fast here instead of silently writing out of bounds or
+# leaving rows uninitialized on the NPU (the spmd block counts and the
+# strided/bulk loops below all assume exact divisibility).
+assert T % VALID_TOKEN_TILE == 0, f"T ({T}) must be divisible by VALID_TOKEN_TILE ({VALID_TOKEN_TILE})"  # build_valid
+assert T % ROPE_TOKEN_TILE == 0, f"T ({T}) must be divisible by ROPE_TOKEN_TILE ({ROPE_TOKEN_TILE})"      # rope
+assert T % QUANT_TOKEN_TILE == 0, f"T ({T}) must be divisible by QUANT_TOKEN_TILE ({QUANT_TOKEN_TILE})"   # quant
+assert PADDED_TOPK % GATHER_FILL_TILE == 0, \
+    f"PADDED_TOPK ({PADDED_TOPK}) must be divisible by GATHER_FILL_TILE ({GATHER_FILL_TILE})"             # gather_kv bulk-zero
+assert H % O_GROUPS == 0, f"H ({H}) must be divisible by O_GROUPS ({O_GROUPS})"                           # rope_pack / o_packed grouping
+assert (O_GROUPS * O_LORA) % B_K_TILE == 0, \
+    f"O_GROUPS*O_LORA ({O_GROUPS * O_LORA}) must be divisible by B_K_TILE ({B_K_TILE})"                   # proj_b K-loop
+assert QUANT_K_TILE % QUANT_TILE == 0, f"QUANT_K_TILE ({QUANT_K_TILE}) must be divisible by QUANT_TILE ({QUANT_TILE})"  # quant inner K
+
 
 def get_standalone_cmp_valid(compress_ratio: int) -> int:
     """Map demo compress-ratio modes to the valid compressed-cache tail length."""
