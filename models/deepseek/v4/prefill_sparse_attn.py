@@ -131,7 +131,7 @@ SPARSE_ROPE_PACK_TOKEN_TILE = ROPE_PACK_TOKEN_TILE
 # AIV parallelism; larger tiles reduce task count but leave longer RoPE work on
 # the critical path.
 SPARSE_ROPE_TOKEN_TILE = 4
-SPARSE_ROPE_APPLY_SPMD_BLOCKS = ((T + SPARSE_ROPE_TOKEN_TILE - 1) // SPARSE_ROPE_TOKEN_TILE) * O_GROUPS
+SPARSE_ROPE_APPLY_SPMD_BLOCKS = (T + SPARSE_ROPE_TOKEN_TILE - 1) // SPARSE_ROPE_TOKEN_TILE
 SPARSE_TOPK = TOPK
 
 @pl.jit.inline
@@ -156,7 +156,6 @@ def _prefill_hca_sparse_from_gathered_kv(
 
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
-    rope_interleave_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
 
     # Per-(token, slot) additive bias: 0 for valid raw indices, -3e38 for
@@ -400,85 +399,60 @@ def _prefill_hca_sparse_from_gathered_kv(
     # Stage 3: inverse RoPE on the rope slice of the attention output.
     # Split by token tile and output group so the long vector RoPE task fans
     # out across all AIV lanes instead of processing all heads in one task.
+    # In-kernel interleaved swap-gather (ported from decode_sparse_attn): one
+    # gather (j^1 swap) + dup-gathered cos/sin replaces the de-interleave/rotate/
+    # re-interleave mask gather+scatter; out[j] = x[j]*cos[j>>1] + x[j^1]*sign[j]
+    # *sin[j>>1] with sign = [+1,-1,...] (conjugate/inverse rotation). All H heads
+    # of a token share cos/sin so they rotate together; rope_buf is BF16 (halves
+    # GM traffic, drops the rope_pack down-cast). Bit-equivalent to the mask path.
+    rope_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
     for rope_apply_block in pl.spmd(SPARSE_ROPE_APPLY_SPMD_BLOCKS, name_hint="prefill_hca_rope_apply_assemble_group"):
-        rope_apply_token_block = rope_apply_block // O_GROUPS
-        rope_apply_g = rope_apply_block - rope_apply_token_block * O_GROUPS
-        rope_apply_t0 = rope_apply_token_block * SPARSE_ROPE_TOKEN_TILE
-        rope_apply_h0 = rope_apply_g * HEADS_PER_GROUP
-
+        rope_apply_t0 = rope_apply_block * SPARSE_ROPE_TOKEN_TILE
+        # swap_idx (j^1), sign and dup_idx (j>>1) are chunk-independent column
+        # patterns from pl.arange -- build once per task.
+        sp_ones = pl.full([H, SPARSE_ROPE_INTERLEAVE_CHUNK], dtype=pl.FP32, value=1.0)
+        sp_col = pl.col_expand_mul(sp_ones, pl.cast(pl.arange(0, [1, SPARSE_ROPE_INTERLEAVE_CHUNK], dtype=pl.INT32), target_type=pl.FP32))
+        sp_dup_f = pl.cast(pl.cast(pl.mul(sp_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        sp_dup_idx = pl.cast(sp_dup_f, target_type=pl.INT32)
+        sp_lane = pl.sub(sp_col, pl.mul(sp_dup_f, 2.0))
+        sp_swap_idx = pl.cast(pl.sub(pl.add(sp_col, 1.0), pl.mul(sp_lane, 2.0)), target_type=pl.INT32)
+        sp_sign = pl.neg(pl.sub(pl.mul(sp_lane, 2.0), 1.0))
         for rope_apply_dt in pl.range(SPARSE_ROPE_TOKEN_TILE):
             rope_apply_t = rope_apply_t0 + rope_apply_dt
             if rope_apply_t < T:
-                rope_apply_head_row = rope_apply_t * H + rope_apply_h0
+                rope_apply_head_row = rope_apply_t * H
 
                 for rope_asm_r0 in pl.range(0, ROPE_HALF, SPARSE_ROPE_CHUNK):
-                    cos_chunk = pl.cast(
-                        freqs_cos[rope_apply_t : rope_apply_t + 1, rope_asm_r0 : rope_asm_r0 + SPARSE_ROPE_CHUNK],
+                    rope_c0 = 2 * rope_asm_r0
+                    r_tile_fp32 = pl.cast(
+                        attn_rope_stage[
+                            rope_apply_head_row : rope_apply_head_row + H,
+                            rope_c0 : rope_c0 + SPARSE_ROPE_INTERLEAVE_CHUNK,
+                        ],
                         target_type=pl.FP32,
                     )
-                    sin_chunk = pl.cast(
-                        freqs_sin[rope_apply_t : rope_apply_t + 1, rope_asm_r0 : rope_asm_r0 + SPARSE_ROPE_CHUNK],
-                        target_type=pl.FP32,
-                    )
-                    rope_tile = attn_rope_stage[
-                        rope_apply_head_row : rope_apply_head_row + HEADS_PER_GROUP,
-                        2 * rope_asm_r0 : 2 * rope_asm_r0 + SPARSE_ROPE_INTERLEAVE_CHUNK,
-                    ]
-                    rope_tile_fp32 = pl.cast(rope_tile, target_type=pl.FP32)
-                    rope_apply_even_chunk = pl.gather(rope_tile_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
-                    rope_apply_odd_chunk = pl.gather(rope_tile_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
-                    rope_even_acc = pl.add(
-                        pl.col_expand_mul(rope_apply_even_chunk, cos_chunk),
-                        pl.col_expand_mul(rope_apply_odd_chunk, sin_chunk),
-                    )
-                    rope_odd_acc = pl.sub(
-                        pl.col_expand_mul(rope_apply_odd_chunk, cos_chunk),
-                        pl.col_expand_mul(rope_apply_even_chunk, sin_chunk),
-                    )
-                    rope_rot_even_chunk = pl.cast(rope_even_acc, target_type=pl.BF16, mode="rint")
-                    rope_rot_odd_chunk = pl.cast(rope_odd_acc, target_type=pl.BF16, mode="rint")
-                    rope_interleave = pl.full([HEADS_PER_GROUP, SPARSE_ROPE_INTERLEAVE_CHUNK], dtype=pl.FP32, value=0.0)
-                    rope_interleave = pl.tensor.scatter(
-                        pl.cast(rope_rot_even_chunk, target_type=pl.FP32),
-                        mask_pattern=pl.tile.MaskPattern.P0101,
-                        dst=rope_interleave,
-                    )
-                    rope_interleave = pl.tensor.scatter(
-                        pl.cast(rope_rot_odd_chunk, target_type=pl.FP32),
-                        mask_pattern=pl.tile.MaskPattern.P1010,
-                        dst=rope_interleave,
-                    )
-                    rope_interleave_buf = pl.assemble(
-                        rope_interleave_buf,
-                        rope_interleave,
-                        [rope_apply_head_row, 2 * rope_asm_r0],
-                    )
+                    r_cos = pl.cast(freqs_cos[rope_apply_t : rope_apply_t + 1, rope_asm_r0 : rope_asm_r0 + SPARSE_ROPE_CHUNK], target_type=pl.FP32)
+                    r_sin = pl.cast(freqs_sin[rope_apply_t : rope_apply_t + 1, rope_asm_r0 : rope_asm_r0 + SPARSE_ROPE_CHUNK], target_type=pl.FP32)
+                    r_cos_h = pl.col_expand_mul(pl.full([H, SPARSE_ROPE_CHUNK], dtype=pl.FP32, value=1.0), r_cos)
+                    r_sin_h = pl.col_expand_mul(pl.full([H, SPARSE_ROPE_CHUNK], dtype=pl.FP32, value=1.0), r_sin)
+                    r_cos_il = pl.gather(r_cos_h, dim=-1, index=sp_dup_idx)
+                    r_sin_il = pl.gather(r_sin_h, dim=-1, index=sp_dup_idx)
+                    r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
+                    r_rot = pl.add(pl.mul(r_tile_fp32, r_cos_il), pl.mul(pl.mul(r_swapped, sp_sign), r_sin_il))
+                    r_rot = pl.cast(r_rot, target_type=pl.BF16, mode="rint")
+                    rope_buf[rope_apply_head_row : rope_apply_head_row + H, rope_c0 : rope_c0 + SPARSE_ROPE_INTERLEAVE_CHUNK] = r_rot
 
-    for rope_pack_block in pl.spmd(SPARSE_ROPE_PACK_SPMD_BLOCKS, name_hint="prefill_hca_rope_pack_group_spmd"):
-        rope_pack_token_block = rope_pack_block // O_GROUPS
-        rope_pack_g = rope_pack_block - rope_pack_token_block * O_GROUPS
-        rope_combine_t0 = rope_pack_token_block * SPARSE_ROPE_PACK_TOKEN_TILE
-
-        for rope_combine_dt in pl.range(SPARSE_ROPE_PACK_TOKEN_TILE):
-            rope_combine_t = rope_combine_t0 + rope_combine_dt
-            if rope_combine_t < T:
-                rope_pack_head_row = rope_combine_t * H + rope_pack_g * HEADS_PER_GROUP
-                rope_tile_full = rope_interleave_buf[
-                    rope_pack_head_row : rope_pack_head_row + HEADS_PER_GROUP,
-                    0 : ROPE_DIM,
-                ]
-                rope_full = pl.cast(
-                    rope_tile_full,
-                    target_type=pl.BF16,
-                )
-                rope_pack_row = rope_pack_g * T + rope_combine_t
-                for rope_pack_hh in pl.range(HEADS_PER_GROUP):
-                    rope_pack_head_col = rope_pack_hh * HEAD_DIM + NOPE_DIM
-                    o_packed = pl.assemble(
-                        o_packed,
-                        rope_full[rope_pack_hh : rope_pack_hh + 1, 0:ROPE_DIM],
-                        [rope_pack_row, rope_pack_head_col],
-                    )
+    # Pack the per-head rope into o_packed's strided rope columns. For a fixed
+    # head, the rope segment lands at the SAME columns for every token, so write
+    # all T tokens of a head in one [T, ROPE_DIM] strided store (ported from
+    # decode_sparse_attn) instead of T separate [1, ROPE_DIM] assembles.
+    rope_buf_3d = pl.reshape(rope_buf, [T, H, ROPE_DIM])
+    for rope_pack_gh in pl.spmd(H, name_hint="prefill_hca_rope_pack_group_spmd"):
+        rope_pack_g = rope_pack_gh // HEADS_PER_GROUP
+        rope_pack_hh = rope_pack_gh - rope_pack_g * HEADS_PER_GROUP
+        rope_pack_tile = pl.reshape(rope_buf_3d[0:T, rope_pack_gh : rope_pack_gh + 1, 0:ROPE_DIM], [T, ROPE_DIM])
+        rope_pack_col = rope_pack_hh * HEAD_DIM + NOPE_DIM
+        o_packed[rope_pack_g * T : rope_pack_g * T + T, rope_pack_col : rope_pack_col + ROPE_DIM] = rope_pack_tile
 
     o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.BF16)
     o_r_i8 = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.INT8)
