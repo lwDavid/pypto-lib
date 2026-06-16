@@ -416,7 +416,7 @@ def sparse_attn(
             o_r_i8[quant_t0:quant_t0 + QUANT_TOKEN_TILE, k1:k1 + QUANT_TILE] = pl.cast(or_q_half, target_type=pl.INT8, mode="trunc")
 
     # INT8 projection `o_r_i8 @ wo_b^T`, then dequantize -> final BF16 output.
-    for nb in pl.spmd(D // B_N_TILE, name_hint="proj_b"):
+    for nb in pl.spmd(D // B_N_TILE, name_hint="proj_b", optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
         # K-split INT8 GEMM + dequant in one scope; T-tiled vec post-process
         # to keep the fused AIV side from oversizing UB (same as proj_a).
         n0 = nb * B_N_TILE
