@@ -1,19 +1,11 @@
-# Copyright (c) PyPTO Contributors.
-# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
-# CANN Open Software License Agreement Version 2.0 (the "License").
-# Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
-# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
-# See LICENSE in the root of the software repository for the full text of the License.
-# -----------------------------------------------------------------------------------------------------------
-
+#!/usr/bin/env python3
 """Export msprof op-simulator Insight traces for all PTOAS funcs in a case build.
 
 Typical usage:
 
   python tools/export_all_kernel_insight.py \
     --build-dir build_output/Qwen3Decode_20260514_195003 \
-    --cann-set-env "$CANN_SET_ENV"
+    --cann-set-env /data/CANN/cann-20260428/cann/set_env.sh
 
   python tools/export_all_kernel_insight.py \
     --case models/qwen3/14b/qwen3_14b_decode.py \
@@ -21,7 +13,7 @@ Typical usage:
     --run-env PTO2_RING_TASK_WINDOW=131072 \
     --run-env PTO2_RING_DEP_POOL=131072 \
     --run-env PTO2_RING_HEAP=536870912 \
-    --cann-set-env "$CANN_SET_ENV" \
+    --cann-set-env /data/CANN/cann-20260428/cann/set_env.sh \
     -- --runtime-profiling
 """
 
@@ -33,7 +25,7 @@ import datetime as _dt
 import os
 import re
 import shutil
-import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -42,32 +34,34 @@ from typing import Iterable
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CANN_SET_ENV = "/data/CANN/cann-20260428/cann/set_env.sh"
 DEFAULT_SOC_VERSION = "dav_2201"
 SUCCESS_TEXT = "Profiling running finished. All task success."
 
 
+def has_generate_testcase(root: Path) -> bool:
+    return (root / "test/npu_validation/scripts/generate_testcase.py").is_file()
+
+
 def default_ptoas_root() -> Path:
-    script = Path("test/npu_validation/scripts/generate_testcase.py")
-    if env_root := os.environ.get("PTOAS_ROOT"):
-        root = repo_path(env_root)
-        if (root / script).is_file():
-            return root
-    for local in (REPO_ROOT / "PTOAS", REPO_ROOT.parent / "PTOAS"):
-        if (local / script).is_file():
-            return local
-    fallback = REPO_ROOT / "PTOAS"
-    return repo_path(fallback)
+    # Prefer a PTOAS *source* checkout (the one that ships generate_testcase.py);
+    # the binary install (e.g. ptoas-bin) lacks it. Try, in order: in-repo PTOAS/,
+    # $PTOAS_ROOT when it points at a real source tree, then ~/PTOAS.
+    candidates = [
+        REPO_ROOT / "PTOAS",
+        repo_path(os.environ["PTOAS_ROOT"]) if os.environ.get("PTOAS_ROOT") else None,
+        Path.home() / "PTOAS",
+    ]
+    for cand in candidates:
+        if cand and has_generate_testcase(cand):
+            return cand
+    # Nothing usable found; fall back to in-repo path so the caller's error
+    # message points at a sensible default.
+    return REPO_ROOT / "PTOAS"
 
 
 def default_pto_isa_root() -> Path:
-    if env_root := os.environ.get("PTO_ISA_ROOT"):
-        root = repo_path(env_root)
-        if root.is_dir():
-            return root
-    for local in (REPO_ROOT / "pto-isa", REPO_ROOT.parent / "pto-isa"):
-        if local.exists():
-            return local
-    return repo_path(Path.home() / "pto-isa")
+    return repo_path(os.environ.get("PTO_ISA_ROOT", str(Path.home() / "pto-isa")))
 
 
 class StepError(RuntimeError):
@@ -99,13 +93,10 @@ def source_env(set_env: str | None, base_env: dict[str, str]) -> dict[str, str]:
         return base_env.copy()
     set_env_path = repo_path(set_env)
     if not set_env_path.is_file():
-        if shutil.which("msprof", path=base_env.get("PATH")):
-            log(f"warning: CANN set_env.sh not found, using current environment: {set_env_path}")
-            return base_env.copy()
         raise StepError(f"CANN set_env.sh not found: {set_env_path}")
     cmd = f"source {sh_quote(str(set_env_path))} >/dev/null && env -0"
     cp = subprocess.run(
-        ["bash", "-c", cmd],
+        ["bash", "-lc", cmd],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -122,7 +113,31 @@ def source_env(set_env: str | None, base_env: dict[str, str]) -> dict[str, str]:
 
 
 def sh_quote(value: str) -> str:
-    return shlex.quote(value)
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _terminate_group(proc: subprocess.Popen) -> None:
+    """Kill the child and every process in its group.
+
+    msprof spawns a long-running simulator grandchild; killing only the direct
+    child (the default subprocess timeout behaviour) leaves that grandchild
+    reparented to init, where it keeps burning CPU forever. Running the child in
+    its own session lets us signal the whole group.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, OSError):
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def run_cmd(
@@ -134,24 +149,44 @@ def run_cmd(
     timeout: int | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    text = "$ " + shlex.join(cmd) + "\n"
-    cp = subprocess.run(
+    text = "$ " + " ".join(sh_quote(c) if " " in c else c for c in cmd) + "\n"
+    # start_new_session=True puts the child in its own process group so that a
+    # timeout can tear down the whole subtree (e.g. the msprof simulator), not
+    # just the immediate child.
+    proc = subprocess.Popen(
         cmd,
         cwd=str(cwd) if cwd else None,
         env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        timeout=timeout,
-        check=False,
+        start_new_session=True,
     )
+    try:
+        stdout, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_group(proc)
+        # Drain whatever the child managed to emit before being killed.
+        try:
+            stdout, _ = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            stdout = ""
+        if log_path:
+            private_dir(log_path.parent)
+            log_path.write_text(
+                text + (stdout or "") + f"\n[timeout after {timeout}s]\n",
+                encoding="utf-8",
+                errors="replace",
+            )
+        raise
+    cp = subprocess.CompletedProcess(cmd, proc.returncode, stdout, None)
     text += cp.stdout
     text += f"\n[exit {cp.returncode}]\n"
     if log_path:
         private_dir(log_path.parent)
         log_path.write_text(text, encoding="utf-8", errors="replace")
     if check and cp.returncode != 0:
-        raise StepError(f"command failed rc={cp.returncode}: {shlex.join(cmd)}")
+        raise StepError(f"command failed rc={cp.returncode}: {' '.join(cmd)}")
     return cp
 
 
@@ -168,15 +203,24 @@ def build_run_command(args: argparse.Namespace, case_args: list[str]) -> list[st
         for item in args.run_env or []:
             if "=" not in item:
                 raise StepError(f"--run-env expects KEY=VALUE, got: {item}")
-            key, value = item.split("=", 1)
-            prefix.append(f"{key}={sh_quote(value)}")
-        base_cmd = " ".join(prefix + [shlex.join(["python", str(case), *case_args])])
+            prefix.append(item)
+        base_cmd = " ".join(prefix + ["python", sh_quote(str(case))] + [sh_quote(x) for x in case_args])
     else:
         return None
 
     if args.task_submit:
-        return ["task-submit", "--device", args.task_device, "--run", base_cmd]
-    return ["bash", "-c", base_cmd]
+        # --max-time 0 (unlimited) by default: the task-submit queue caps tasks at
+        # 300s, which truncates long case runs / msprof sweeps mid-flight.
+        return [
+            "task-submit",
+            "--run",
+            "--device",
+            args.task_device,
+            "--max-time",
+            str(args.task_max_time),
+            base_cmd,
+        ]
+    return ["bash", "-lc", base_cmd]
 
 
 def build_output_dirs(build_output_root: Path) -> set[Path]:
@@ -280,26 +324,6 @@ def make_ld_library_path(build_dir: Path, env: dict[str, str], soc_version: str)
     return ":".join(parts)
 
 
-def demangle_symbols(symbols: list[str]) -> list[tuple[str, str]]:
-    if not symbols:
-        return []
-    try:
-        cp = subprocess.run(
-            ["c++filt"],
-            input="\n".join(symbols) + "\n",
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-    except OSError:
-        return [(sym, sym) for sym in symbols]
-    demangled = cp.stdout.splitlines()
-    if cp.returncode != 0 or len(demangled) != len(symbols):
-        return [(sym, sym) for sym in symbols]
-    return [(sym, dem or sym) for sym, dem in zip(symbols, demangled)]
-
-
 def resolve_symbol(kernel_lib: Path, preferred_names: list[str]) -> tuple[str, str]:
     nm = run_cmd(["nm", "-D", str(kernel_lib)], check=True)
     symbols = []
@@ -307,16 +331,17 @@ def resolve_symbol(kernel_lib: Path, preferred_names: list[str]) -> tuple[str, s
         fields = line.split()
         if len(fields) >= 3 and fields[-2] in {"T", "W"}:
             symbols.append(fields[-1])
-    candidates = demangle_symbols(symbols)
+    candidates: list[tuple[str, str]] = []
+    for sym in symbols:
+        cf = run_cmd(["c++filt", sym], check=False)
+        demangled = cf.stdout.strip() or sym
+        candidates.append((sym, demangled))
     for name in preferred_names:
         for sym, demangled in candidates:
-            if demangled.startswith(name + "("):
-                return sym, demangled
-    # C-linkage device kernels demangle to the bare name (no arg list); match
-    # those exactly, preferring them over any host Launch* wrapper.
-    for name in preferred_names:
-        for sym, demangled in candidates:
-            if demangled == name:
+            # Match either a mangled C++ kernel (demangled "name(...)") or an
+            # extern "C" kernel exported under its plain, unmangled name (whose
+            # demangled form is just "name" with no parameter list).
+            if demangled.startswith(name + "(") or demangled == name or sym == name:
                 return sym, demangled
     if len(candidates) == 1:
         return candidates[0]
@@ -564,6 +589,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     input_group.add_argument("--run-cmd", help="Arbitrary shell command to run before exporting")
     input_group.add_argument("--task-submit", action="store_true", help="Wrap --case/--run-cmd with task-submit --run")
     input_group.add_argument("--task-device", default="auto", help="task-submit --device value")
+    input_group.add_argument("--task-max-time", default="0", help="task-submit --max-time seconds (0=unlimited); default 0 avoids the queue's 300s cap truncating long runs")
     input_group.add_argument("--run-env", action="append", default=[], help="KEY=VALUE env prefix for --case; can be repeated")
     input_group.add_argument("--build-output-root", default=str(REPO_ROOT / "build_output"), help="Root used to locate the latest build after running a case")
     input_group.add_argument("--ptoas-dir", help="Explicit directory containing source PTOAS .cpp files")
@@ -572,11 +598,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     input_group.add_argument("--list-funcs", action="store_true", help="List discovered func names and exit before generating traces")
 
     tool_group = parser.add_argument_group("toolchain")
-    tool_group.add_argument(
-        "--cann-set-env",
-        default=os.environ.get("CANN_SET_ENV"),
-        help="CANN set_env.sh used for cmake/msprof; defaults to CANN_SET_ENV, otherwise the current environment is used",
-    )
+    tool_group.add_argument("--cann-set-env", default=os.environ.get("CANN_SET_ENV", DEFAULT_CANN_SET_ENV), help="CANN set_env.sh used for cmake/msprof")
     tool_group.add_argument("--ptoas-root", default=default_ptoas_root(), help="PTOAS repo root containing generate_testcase.py")
     tool_group.add_argument("--pto-isa-root", default=default_pto_isa_root(), help="pto-isa root passed to CMake")
     tool_group.add_argument("--soc-version", default=os.environ.get("SOC_VERSION", DEFAULT_SOC_VERSION), help="SOC version for testcase generation and msprof")
@@ -589,7 +611,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
 
     prof_group = parser.add_argument_group("profiling")
     prof_group.add_argument("--launch-count", type=int, default=1, help="msprof --launch-count")
-    prof_group.add_argument("--msprof-timeout", type=int, default=180, help="msprof simulator timeout seconds")
+    prof_group.add_argument("--msprof-timeout", type=int, default=600, help="msprof simulator timeout seconds")
     prof_group.add_argument("--step-timeout", type=int, default=300, help="timeout for testcase generation/cmake/golden")
     prof_group.add_argument("--build-timeout", type=int, default=600, help="timeout for cmake build per func")
 
@@ -658,7 +680,7 @@ def main(argv: list[str] | None = None) -> int:
         f"repo_root={REPO_ROOT}",
         f"build_dir={build_dir}",
         f"source_count={len(sources)}",
-        f"cann_set_env={repo_path(args.cann_set_env) if args.cann_set_env else ''}",
+        f"cann_set_env={repo_path(args.cann_set_env)}",
         f"soc_version={args.soc_version}",
         f"ptoas_root={args.ptoas_root}",
         f"pto_isa_root={args.pto_isa_root}",
@@ -710,4 +732,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except StepError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from None
+        raise SystemExit(1)
