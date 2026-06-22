@@ -153,6 +153,10 @@ def prefill_attention_hca(
     rope_cos_half_t = pl.create_tensor([T, ROPE_HALF], dtype=pl.FP32)
     rope_sin_half_t = pl.create_tensor([T, ROPE_HALF], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_rope_half"):
+        # Identity-init all T rows (cos=1, sin=0) so padding rows (>= num_tokens) stay finite:
+        # prefill_sparse_attn rotates all T rows.
+        rope_cos_half_t[0:T, 0:ROPE_HALF] = pl.full([T, ROPE_HALF], dtype=pl.FP32, value=1.0)
+        rope_sin_half_t[0:T, 0:ROPE_HALF] = pl.full([T, ROPE_HALF], dtype=pl.FP32, value=0.0)
         for half_t in pl.range(T):
             if half_t < num_tokens:
                 rope_cos_half_t[half_t : half_t + 1, 0:ROPE_HALF] = pl.cast(

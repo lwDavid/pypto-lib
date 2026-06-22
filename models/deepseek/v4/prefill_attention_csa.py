@@ -185,17 +185,17 @@ def prefill_attention_csa(
     rope_cos_half_t = pl.create_tensor([T, HALF_ROPE], dtype=pl.FP32)
     rope_sin_half_t = pl.create_tensor([T, HALF_ROPE], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_rope_half"):
+        # Identity-init all T rows (cos=1, sin=0) so padding rows (>= num_tokens) stay finite:
+        # prefill_sparse_attn rotates all T rows. Active rows are overwritten below by slicing
+        # the already-materialized rope_cos_t/rope_sin_t (no redundant freqs_cos GM re-read).
+        rope_cos_half_t[0:T, 0:HALF_ROPE] = pl.full([T, HALF_ROPE], dtype=pl.FP32, value=1.0)
+        rope_sin_half_t[0:T, 0:HALF_ROPE] = pl.full([T, HALF_ROPE], dtype=pl.FP32, value=0.0)
         for half_t in pl.range(T):
             if half_t < num_tokens:
-                half_pos = pl.cast(pl.read(position_ids, [half_t]), pl.INDEX)
-                rope_cos_half_t = pl.assemble(
-                    rope_cos_half_t,
-                    pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [half_pos, 0]), target_type=pl.FP32),
-                    [half_t, 0])
-                rope_sin_half_t = pl.assemble(
-                    rope_sin_half_t,
-                    pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [half_pos, 0]), target_type=pl.FP32),
-                    [half_t, 0])
+                rope_cos_half_t[half_t : half_t + 1, 0:HALF_ROPE] = pl.cast(
+                    rope_cos_t[half_t : half_t + 1, 0:HALF_ROPE], target_type=pl.FP32)
+                rope_sin_half_t[half_t : half_t + 1, 0:HALF_ROPE] = pl.cast(
+                    rope_sin_t[half_t : half_t + 1, 0:HALF_ROPE], target_type=pl.FP32)
     q = qkv_proj_rope(
         x_normed,
         wq_a,

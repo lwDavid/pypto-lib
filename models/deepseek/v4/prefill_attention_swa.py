@@ -152,6 +152,10 @@ def prefill_attention_swa(
     rope_cos_half = pl.create_tensor([T, HALF_ROPE], dtype=pl.FP32)
     rope_sin_half = pl.create_tensor([T, HALF_ROPE], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_rope_half"):
+        # Identity-init all T rows (cos=1, sin=0) so padding rows (>= num_tokens) stay finite:
+        # prefill_sparse_attn rotates all T rows.
+        rope_cos_half[0:T, 0:HALF_ROPE] = pl.full([T, HALF_ROPE], dtype=pl.FP32, value=1.0)
+        rope_sin_half[0:T, 0:HALF_ROPE] = pl.full([T, HALF_ROPE], dtype=pl.FP32, value=0.0)
         for half_t in pl.range(T):
             if half_t < num_tokens:
                 rope_cos_half[half_t : half_t + 1, 0:HALF_ROPE] = pl.cast(
