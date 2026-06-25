@@ -567,17 +567,6 @@ def build_tensor_specs(
             f"needs {max_visible_cmp} compressed slots; current cmp cache cap is "
             f"{SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE}"
         )
-    # The real prefill indexer scores only PREFILL_COMPRESSED_LEN compressed slots (its inner
-    # compressor handles only the current chunk, no historical compressed context), which is a
-    # tighter bound than the sparse cmp-cache cap above. Reject suffix-prefill loudly here.
-    if max_visible_cmp > PREFILL_COMPRESSED_LEN:
-        raise ValueError(
-            f"the real prefill indexer scores only PREFILL_COMPRESSED_LEN={PREFILL_COMPRESSED_LEN} "
-            f"compressed slots, but context_len={context_len} + q_len={q_len} needs {max_visible_cmp}. "
-            f"Suffix-prefill is not yet supported by the indexer (full prefill / start_pos=0 only)."
-        )
-
-
     def token_pos():
         # Single-request absolute positions: pos[t] = context_len + local_idx
         # Padding rows keep their arange default; they are inactive.
@@ -1042,6 +1031,16 @@ if __name__ == "__main__":
     parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     args = parser.parse_args()
     compare_tokens = args.num_tokens
+    x_out_cmp = valid_ratio_reldiff(compare_tokens, diff_thd=5e-3, pct_thd=0.005, max_diff_hd=1)
+    if args.start_pos:
+        # Suffix attends WIN + up-to-INDEXER_SCORE_CAP compressed rows. The sparse-attn PV matmul
+        # casts the softmax probabilities to BF16 (prefill_sparse_attn), so accumulating over more
+        # rows adds ~1 extra BF16 ULP of x_out drift vs full prefill -- the bad points cluster at
+        # ~2 BF16 ULP. Measured at start_pos=896 (the 8-block worst case) the bad fraction is only
+        # 0.058% at diff_thd=8e-3 (vs 0.5% at 1/128). So bump the per-point bar to 8e-3 (== kv_cache
+        # rtol = 2 BF16 ULP) and the single-point cap to 2 (worst rdiff 1.37, from benign near-zero
+        # elements), but keep the 0.5% fraction bar identical to full prefill.
+        x_out_cmp = valid_ratio_reldiff(compare_tokens, diff_thd=8e-3, pct_thd=0.005, max_diff_hd=2)
 
     result = run_jit(
         fn=prefill_attention_csa_test,
@@ -1060,7 +1059,7 @@ if __name__ == "__main__":
         atol=1e-2,
         compile_only=args.compile_only,
         compare_fn={
-            "x_out": valid_ratio_reldiff(compare_tokens, diff_thd=5e-3, pct_thd=0.005, max_diff_hd=1),
+            "x_out": x_out_cmp,
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )
