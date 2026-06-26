@@ -186,19 +186,27 @@ def sparse_attn(
             # in-range) and the NEG_INF bias zeros its softmax weight.
             qk_kv = pl.create_l1([ATTN_K_TILE, HEAD_DIM], pl.BF16)
             for qk_r in pl.range(ATTN_K_TILE):
-                qk_ridx = pl.read(cmp_sparse_indices, [qk_t, qk_s0 + qk_r])
-                if qk_ridx >= 0:
-                    if qk_ridx < WIN:
-                        qk_src = qk_ori_base + qk_ridx
-                        qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [qk_src, 0], [1, HEAD_DIM])
-                    elif qk_ridx < WIN + S:
-                        qk_ov = qk_overlay_base + (qk_ridx - WIN)
-                        qk_kv = pl.gather_row(qk_kv, mtp_kv_overlay, [qk_r, 0], [qk_ov, 0], [1, HEAD_DIM])
+                qk_k = qk_s0 + qk_r
+                # Guard padded lanes: cmp_sparse_indices is [T, TOPK], so only read
+                # slots < TOPK (same bound the old gather_kv_cmp used). A padded lane
+                # (qk_k >= TOPK, only when PADDED_TOPK > TOPK) has no topk entry --
+                # gather row 0 and let the NEG_INF pad bias zero its softmax weight.
+                if qk_k < TOPK:
+                    qk_ridx = pl.read(cmp_sparse_indices, [qk_t, qk_k])
+                    if qk_ridx >= 0:
+                        if qk_ridx < WIN:
+                            qk_src = qk_ori_base + qk_ridx
+                            qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [qk_src, 0], [1, HEAD_DIM])
+                        elif qk_ridx < WIN + S:
+                            qk_ov = qk_overlay_base + (qk_ridx - WIN)
+                            qk_kv = pl.gather_row(qk_kv, mtp_kv_overlay, [qk_r, 0], [qk_ov, 0], [1, HEAD_DIM])
+                        else:
+                            qk_slot = qk_ridx - (WIN + S)
+                            qk_cblk = pl.cast(pl.read(cmp_block_table, [qk_b, qk_slot // BLOCK_SIZE]), pl.INDEX)
+                            qk_csrc = qk_cblk * BLOCK_SIZE + qk_slot % BLOCK_SIZE
+                            qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [qk_r, 0], [qk_csrc, 0], [1, HEAD_DIM])
                     else:
-                        qk_slot = qk_ridx - (WIN + S)
-                        qk_cblk = pl.cast(pl.read(cmp_block_table, [qk_b, qk_slot // BLOCK_SIZE]), pl.INDEX)
-                        qk_csrc = qk_cblk * BLOCK_SIZE + qk_slot % BLOCK_SIZE
-                        qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [qk_r, 0], [qk_csrc, 0], [1, HEAD_DIM])
+                        qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [0, 0], [1, HEAD_DIM])
                 else:
                     qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [0, 0], [1, HEAD_DIM])
 
