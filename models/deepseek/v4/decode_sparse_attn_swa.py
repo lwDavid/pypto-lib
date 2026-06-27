@@ -97,6 +97,11 @@ TOPK = WIN
 SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 assert WIN <= TOPK <= TOPK_FULL, f"TOPK ({TOPK}) must be in [WIN={WIN}, TOPK_FULL={TOPK_FULL}]"
+# ZERO-GATHER contract: qk_pv reads the ring page (block 0) and the whole mtp_kv_overlay
+# tensor (block 1) directly as ATTN_K_TILE-row GM slices, so the window page must be exactly
+# one tile (WIN == ATTN_K_TILE) and the overlay must fit one tile (T == ATTN_K_TILE).
+assert WIN == ATTN_K_TILE, f"SWA zero-gather requires WIN ({WIN}) == ATTN_K_TILE ({ATTN_K_TILE})"
+assert T == ATTN_K_TILE, f"SWA zero-gather requires T ({T}) == ATTN_K_TILE ({ATTN_K_TILE})"
 
 
 @pl.jit.inline

@@ -98,6 +98,9 @@ TOPK = WIN + S + min(MAX_SEQ_LEN // 128, IDX_TOPK)
 SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 assert WIN <= TOPK <= TOPK_FULL, f"TOPK ({TOPK}) must be in [WIN={WIN}, TOPK_FULL={TOPK_FULL}]"
+# ZERO-GATHER contract: block 0 reads the window ring page directly as an ATTN_K_TILE-row
+# GM slice, so the window page must be exactly one tile.
+assert WIN == ATTN_K_TILE, f"HCA zero-gather requires WIN ({WIN}) == ATTN_K_TILE ({ATTN_K_TILE})"
 
 
 @pl.jit.inline

@@ -22,7 +22,7 @@ from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
-from decode_sparse_attn_swa import sparse_attn_swa, ATTN_K_TILE, PADDED_TOPK, NEG_INF
+from decode_sparse_attn_swa import sparse_attn_swa, ATTN_K_TILE, PADDED_TOPK, TOPK, NEG_INF
 
 
 # model config
@@ -60,6 +60,7 @@ SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
 SWA_TOPK_TOKEN_TILE = 8   # tokens per overlay-topk SPMD block
 SWA_WB_TOKEN_TILE = 32  # tokens per cache-writeback SPMD block
+WRITEBACK_GUARD_TILE = 16  # head cols folded with attn_out*0 to order the writeback after sparse_attn
 S_F = float(S)            # float consts for the win_bias build (float() is not callable inside the tracer)
 WIN_F = float(WIN)
 
@@ -141,7 +142,7 @@ def attention_swa(
     # r<=abs_pos AND r is not a current MTP token's ring slot (pos%WIN, those attend via
     # the overlay); overlay row o valid iff b*S<=o<=t (causal). sparse_topk is a
     # placeholder kept only for the (unused) kernel cmp_sparse_indices slot.
-    sparse_topk = pl.create_tensor([T, WIN], dtype=pl.INT32)
+    sparse_topk = pl.create_tensor([T, TOPK], dtype=pl.INT32)
     win_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
     for wb_blk in pl.spmd(T // SWA_TOPK_TOKEN_TILE, name_hint="swa_win_bias"):
         wb_t0 = wb_blk * SWA_TOPK_TOKEN_TILE
@@ -200,13 +201,16 @@ def attention_swa(
                 # token's writeback to slot p%WIN must not race a *sibling* token's
                 # valid read of that same slot (e.g. start=127: the s=1 token writes
                 # ring slot 0, which the s=0 token reads as historical pos 0). Folding a
-                # zeroed attn_out read into the stored value forces this writeback after
-                # sparse_attn has produced attn_out (i.e. after all its KV reads), with
-                # no change to the data (pypto-lib#481).
-                wb_guard = pl.mul(pl.cast(attn_out[write_t : write_t + 1, 0 : HEAD_DIM], target_type=pl.FP32), 0.0)
-                wb_kv_f = pl.cast(kv[write_t : write_t + 1, 0 : HEAD_DIM], target_type=pl.FP32)
-                kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = pl.cast(
-                    pl.add(wb_kv_f, wb_guard), target_type=pl.BF16)
+                # zeroed attn_out read into only the first WRITEBACK_GUARD_TILE cols
+                # (one 32-byte burst -> serializes the whole row's writeback) orders this
+                # store after sparse_attn produced attn_out, with no data change; the
+                # remaining cols are a raw copy (no cast/arith) (pypto-lib#481).
+                write_guard = pl.cast(attn_out[write_t : write_t + 1, 0 : WRITEBACK_GUARD_TILE], target_type=pl.FP32)
+                write_zero = pl.mul(write_guard, 0.0)
+                write_kv_head = pl.cast(kv[write_t : write_t + 1, 0 : WRITEBACK_GUARD_TILE], target_type=pl.FP32)
+                kv_cache_flat[write_row : write_row + 1, 0 : WRITEBACK_GUARD_TILE] = pl.cast(
+                    pl.add(write_kv_head, write_zero), target_type=pl.BF16)
+                kv_cache_flat[write_row : write_row + 1, WRITEBACK_GUARD_TILE : HEAD_DIM] = kv[write_t : write_t + 1, WRITEBACK_GUARD_TILE : HEAD_DIM]
 
     hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
