@@ -248,7 +248,14 @@ def prefill_indexer(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_init"):
             score_wide[si : si + SCORE_INIT_TILE, :] = pl.full([SCORE_INIT_TILE, SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score"):
+    # === score: split into two GM-handoff stages (mirrors decode_indexer's score_mat/score_reduce).
+    # a5 miscompiles the fused cube(int8 matmul)+vector(dequant/relu/reduce) score kernel, so the
+    # INT8 matmul runs in its own cube kernel into a GM INT32 scratch, and the FP32 dequant/reduce
+    # runs in a separate vector kernel. Math and runtime guards are unchanged from the fused form.
+    score_acc_gm = pl.create_tensor([T * INDEXER_SCORE_CAP, IDX_N_HEADS], dtype=pl.INT32)
+
+    # Stage 1 (cube): paged C8 INT8 KV x INT8 Hadamard-Q -> INT32 accumulator in GM.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_mat"):
         last_pos = pl.read(position_ids, [num_tokens - 1])
         max_visible = pl.min((last_pos + 1) // COMPRESS_RATIO, INDEXER_SCORE_CAP)
         for cb in pl.range(INDEXER_SCORE_BLOCKS):
@@ -256,29 +263,42 @@ def prefill_indexer(
             if max_visible > cache0:
                 idx_blk_id = pl.cast(pl.read(idx_block_table, [cache0 // BLOCK_SIZE]), pl.INDEX)
                 kv_row0 = idx_blk_id * BLOCK_SIZE + (cache0 % BLOCK_SIZE)
-                # C8: the compressor stored this block as INT8 + a per-position dequant scale; read
-                # both from the paged cache directly (no score-time re-quant).
+                # C8: read the paged INT8 block directly (compressor stored INT8 + scale).
                 kv_q_i8_full = kv_cache_i8_flat[kv_row0 : kv_row0 + CACHE_TILE, 0 : IDX_HEAD_DIM]
-                kv_cache_scale_dq = kv_scale_flat[kv_row0 : kv_row0 + CACHE_TILE, :]
                 for t in pl.range(T):
                     if t < num_tokens:
                         q_s0 = t * IDX_N_HEADS
                         qr_hadamard_tile = qr_hadamard_i8[q_s0 : q_s0 + IDX_N_HEADS, 0:IDX_HEAD_DIM]
                         score_acc_s = pl.matmul(kv_q_i8_full, qr_hadamard_tile, out_dtype=pl.INT32, b_trans=True)
-                        qh_scale_s = pl.reshape(qr_hadamard_scale_dq[q_s0 : q_s0 + IDX_N_HEADS, :], [1, IDX_N_HEADS])
-                        score_tile_s = pl.cast(score_acc_s, target_type=pl.FP32, mode="none")
-                        score_tile_s = pl.col_expand_mul(pl.row_expand_mul(score_tile_s, kv_cache_scale_dq), qh_scale_s)
-                        relu_score_s = pl.maximum(score_tile_s, pl.mul(score_tile_s, 0.0))
-                        weighted_score_s = pl.reshape(pl.row_sum(pl.col_expand_mul(relu_score_s, weights[t : t + 1, :])), [1, CACHE_TILE])
-                        pos = pl.read(position_ids, [t])
-                        visible_t = pl.min((pos + 1) // COMPRESS_RATIO, INDEXER_SCORE_CAP)
-                        if visible_t > cache0:
-                            valid_len_t = pl.min(CACHE_TILE, visible_t - cache0)
-                        else:
-                            valid_len_t = 0
-                        weighted_valid_t = pl.fillpad(pl.set_validshape(weighted_score_s, 1, valid_len_t), pad_value=pl.PadValue.min)
-                        weighted_valid_t = pl.maximum(weighted_valid_t, pl.full([1, CACHE_TILE], dtype=pl.FP32, value=FP32_NEG_INF))
-                        score_wide[t : t + 1, cache0 : cache0 + CACHE_TILE] = weighted_valid_t
+                        score_base = t * INDEXER_SCORE_CAP + cache0
+                        score_acc_gm[score_base : score_base + CACHE_TILE, :] = score_acc_s
+
+    # Stage 2 (vector): cast/dequant/relu/weighted row_sum, pad, into the wide sort scratch.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_reduce"):
+        for cb in pl.range(INDEXER_SCORE_BLOCKS):
+            cache0 = cb * CACHE_TILE
+            idx_blk_id = pl.cast(pl.read(idx_block_table, [cache0 // BLOCK_SIZE]), pl.INDEX)
+            kv_row0 = idx_blk_id * BLOCK_SIZE + (cache0 % BLOCK_SIZE)
+            kv_cache_scale_dq = kv_scale_flat[kv_row0 : kv_row0 + CACHE_TILE, :]
+            for t in pl.range(T):
+                if t < num_tokens:
+                    q_s0 = t * IDX_N_HEADS
+                    qh_scale_s = pl.reshape(qr_hadamard_scale_dq[q_s0 : q_s0 + IDX_N_HEADS, :], [1, IDX_N_HEADS])
+                    score_base = t * INDEXER_SCORE_CAP + cache0
+                    score_acc_red = score_acc_gm[score_base : score_base + CACHE_TILE, :]
+                    score_tile_s = pl.cast(score_acc_red, target_type=pl.FP32, mode="none")
+                    score_tile_s = pl.col_expand_mul(pl.row_expand_mul(score_tile_s, kv_cache_scale_dq), qh_scale_s)
+                    relu_score_s = pl.maximum(score_tile_s, pl.mul(score_tile_s, 0.0))
+                    weighted_score_s = pl.reshape(pl.row_sum(pl.col_expand_mul(relu_score_s, weights[t : t + 1, :])), [1, CACHE_TILE])
+                    pos = pl.read(position_ids, [t])
+                    visible_t = pl.min((pos + 1) // COMPRESS_RATIO, INDEXER_SCORE_CAP)
+                    if visible_t > cache0:
+                        valid_len_t = pl.min(CACHE_TILE, visible_t - cache0)
+                    else:
+                        valid_len_t = 0
+                    weighted_valid_t = pl.fillpad(pl.set_validshape(weighted_score_s, 1, valid_len_t), pad_value=pl.PadValue.min)
+                    weighted_valid_t = pl.maximum(weighted_valid_t, pl.full([1, CACHE_TILE], dtype=pl.FP32, value=FP32_NEG_INF))
+                    score_wide[t : t + 1, cache0 : cache0 + CACHE_TILE] = weighted_valid_t
 
     # Expose the real per-key scores (first INDEXER_SCORE_CAP cols of the wide sort scratch).
     score_out_flat = pl.reshape(score, [T, INDEXER_SCORE_CAP])
